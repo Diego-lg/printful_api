@@ -105,10 +105,11 @@ class PrintfulClient:
         product_id: int, 
         variant_ids: List[int], 
         image_url: str,
+        option_groups: List[str] = ['On Hanger'],
         placement: str = "default",
         format: str = "jpg",
         product_template_id: int = None,
-        position: dict = None
+        design_params: list = None
     ) -> Dict[str, Any]:
         """
         Create a mockup generation task.
@@ -120,7 +121,7 @@ class PrintfulClient:
             placement: The placement on the product (default: "default")
             format: The output format (default: "jpg")
             product_template_id: Optional product template ID
-            position: Optional position dict with area_width, area_height, width, height, top, left
+            design_params: Optional list of design parameters with x, y, scale, rotation
             
         Returns:
             Dictionary containing task information with task_key
@@ -128,17 +129,65 @@ class PrintfulClient:
         # Build the payload according to Printful API format
         # Reference: https://www.printful.com/docs/mockup-generator
         
+        # Log the design_params for debugging
+        logger.debug(f"create_mockup_task called with design_params: {design_params}")
+        
         # Default position based on product 257 templates (template_id 3920)
         # print_area_width: 2332.0, print_area_height: 3000.0, print_area_top: 0.0, print_area_left: 334.0
-        if position is None:
-            position = {
-                "area_width": 2332,
-                "area_height": 3000,
-                "width": 2332,
-                "height": 3000,
-                "top": 0,
-                "left": 334
-            }
+        position = {
+            "area_width": 2332,
+            "area_height": 3000,
+            "width": 2332,
+            "height": 3000,
+            "top": 0,
+            "left": 334
+        }
+        
+        # Apply design_params if provided
+        if design_params and len(design_params) > 0:
+            logger.info(f"Processing design_params: {design_params}")
+            params = design_params[0]  # Get first layer's params
+            
+            # Debug: Log what we got from params
+            logger.debug(f"params type: {type(params)}, params: {params}")
+            
+            # Convert percentage-based position to Printful coordinates
+            # x and y are in percentages (0-100), need to convert to pixels
+            # Printful uses area_width/area_height as the print area
+            x_pct = params.get("x", 50) if isinstance(params, dict) else 50  # Default center
+            y_pct = params.get("y", 50) if isinstance(params, dict) else 50  # Default center
+            scale = params.get("scale", 100) if isinstance(params, dict) else 100  # Default 100%
+            rotation = params.get("rotation", 0) if isinstance(params, dict) else 0  # Default 0 degrees
+            
+            # Debug: Log extracted values
+            logger.debug(f"x_pct: {x_pct} (type: {type(x_pct)}), y_pct: {y_pct} (type: {type(y_pct)}), scale: {scale} (type: {type(scale)}), rotation: {rotation} (type: {type(rotation)})")
+            
+            # Validate types before calculation
+            if not isinstance(x_pct, (int, float)):
+                raise ValueError(f"x_pct should be int/float, got {type(x_pct)}: {x_pct}")
+            if not isinstance(y_pct, (int, float)):
+                raise ValueError(f"y_pct should be int/float, got {type(y_pct)}: {y_pct}")
+            if not isinstance(scale, (int, float)):
+                raise ValueError(f"scale should be int/float, got {type(scale)}: {scale}")
+            
+            # Calculate actual dimensions based on scale
+            # Scale 100% = full print area width
+            scale_factor = scale / 100.0
+            position["width"] = int(position["area_width"] * scale_factor)
+            position["height"] = int(position["area_height"] * scale_factor)
+            
+            # Calculate position (centered on x, y percentage)
+            # x = 50% means center horizontally
+            # y = 50% means center vertically
+            position["left"] = int((position["area_width"] * x_pct / 100) - (position["width"] / 2))
+            position["top"] = int((position["area_height"] * y_pct / 100) - (position["height"] / 2))
+            
+            # Add rotation to position if provided (Printful API expects rotation in degrees)
+            if rotation is not None and rotation != 0:
+                position["rotation"] = rotation
+            
+            logger.info(f"Converted position: {position}")
+            logger.info(f"Scale: {scale}%, Rotation: {rotation}°")
         
         # Build the files array with position (without extra options)
         files = [
@@ -149,12 +198,16 @@ class PrintfulClient:
             }
         ]
         
+        # Log the final files array for debugging
+        logger.info(f"Printful API files payload: {files}")
+        
         # Build the payload matching the exact API format from Postman collection
         payload = {
             "variant_ids": variant_ids,
             "format": format,
             "width": 0,
             "product_options": {},
+            "option_groups": option_groups,
             "files": files
         }
         

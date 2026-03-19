@@ -1,6 +1,7 @@
 import os
 import time
 import uuid
+import json
 import logging
 import werkzeug
 from datetime import datetime
@@ -253,6 +254,22 @@ def upload_file():
         create_mockup = request.form.get("create_mockup", "false").lower() == "true"
         logger.debug(f"create_mockup flag: {create_mockup}")
         
+        # DEBUG: Log design_params received from frontend
+        design_params_str = request.form.get("design_params")
+        logger.debug(f"design_params received: {design_params_str}")
+        
+        if design_params_str:
+            import json
+            try:
+                design_params = json.loads(design_params_str)
+                logger.info(f"Parsed design_params: {design_params}")
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse design_params: {e}")
+                design_params = []
+        else:
+            logger.warning("No design_params received from frontend!")
+            design_params = []
+        
         if create_mockup:
             logger.info("Creating mockup requested")
             # Use the R2 public URL for Printful to fetch
@@ -301,7 +318,8 @@ def upload_file():
                 mockup_response = timeout(30)(printful_client.create_mockup_task)(
                     product_id=PRODUCT_ID,
                     variant_ids=[VARIANT_ID],
-                    image_url=r2_public_url
+                    image_url=r2_public_url,
+                    design_params=design_params
                 )
                 
                 mockup_duration = (time.time() - mockup_start_time) * 1000
@@ -674,6 +692,688 @@ def get_mockup_result(task_key):
             "error": str(e)
         }), 500
 
+
+# ============================================================
+# BATCH MOCKUP GENERATION
+# ============================================================
+
+# Create mockup variations folder
+MOCKUP_VARIATIONS_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mockup_variations")
+os.makedirs(MOCKUP_VARIATIONS_FOLDER, exist_ok=True)
+logger.info(f"Mockup variations folder: {MOCKUP_VARIATIONS_FOLDER}")
+
+# Serve mockup variations folder
+@app.route("/mockup_variations/<path:filename>")
+def serve_mockup_variation(filename):
+    """Serve mockup variation images."""
+    return send_from_directory(MOCKUP_VARIATIONS_FOLDER, filename)
+
+
+def create_batch_folder(batch_id):
+    """Create a folder for a batch."""
+    batch_folder = os.path.join(MOCKUP_VARIATIONS_FOLDER, batch_id)
+    os.makedirs(batch_folder, exist_ok=True)
+    return batch_folder
+
+
+def save_mockup_image(mockup_url, batch_folder, config_index):
+    """Download and save mockup image from URL."""
+    try:
+        import urllib.request
+        import urllib.error
+        
+        # Generate filename
+        filename = f"mockup_{config_index}.png"
+        filepath = os.path.join(batch_folder, filename)
+        
+        # Download image
+        logger.info(f"Downloading mockup from: {mockup_url}")
+        urllib.request.urlretrieve(mockup_url, filepath)
+        
+        logger.info(f"Mockup saved to: {filepath}")
+        return filepath
+    except Exception as e:
+        logger.error(f"Failed to save mockup image: {e}")
+        return None
+
+
+def process_single_configuration(config, index, design_url):
+    """Process a single configuration - called by background thread.
+    
+    Creates a mockup task via Printful API and returns the result.
+    """
+    try:
+        # Create design_params for Printful
+        design_params = [{
+            "name": f"Layer {index + 1}",
+            "x": config.get("x", 50),
+            "y": config.get("y", 50),
+            "scale": config.get("scale", 100),
+            "rotation": config.get("rotation", 0)
+        }]
+        
+        # DEBUG: Log design_params before calling API
+        logger.info(f"Background: Creating mockup for config {index + 1}: {config}")
+        logger.info(f"Background: design_params for config {index + 1}: {design_params}")
+        
+        # DEBUG: Log all params being passed
+        logger.info(f"Background: Calling create_mockup_task with:")
+        logger.info(f"  product_id: {PRODUCT_ID}")
+        logger.info(f"  variant_ids: {[VARIANT_ID]}")
+        logger.info(f"  image_url: {design_url}")
+        logger.info(f"  design_params: {design_params}")
+        
+        response = printful_client.create_mockup_task(
+            product_id=PRODUCT_ID,
+            variant_ids=[VARIANT_ID],
+            image_url=design_url,
+            design_params=design_params
+        )
+        
+        # Log full Printful response for debugging
+        logger.info(f"Background: Printful create-task response: {response}")
+        
+        task_key = response.get("task_key") or response.get("result", {}).get("task_key")
+        logger.info(f"Background: Extracted task_key: {task_key}")
+        
+        return {
+            "index": index,
+            "config": config,
+            "task_key": task_key,
+            "status": "created",
+            "error": None
+        }
+    except Exception as e:
+        import traceback
+        logger.error(f"Background: Error creating mockup for config {index}: {e}")
+        logger.error(f"Background: Full traceback: {traceback.format_exc()}")
+        return {
+            "index": index,
+            "config": config,
+            "task_key": None,
+            "status": "error",
+            "error": str(e)
+        }
+
+
+@app.route("/api/batch-mockups", methods=["POST"])
+def create_batch_mockups():
+    """Create multiple mockups with different configurations.
+    
+    This endpoint returns immediately after saving metadata.
+    Configurations are processed in a background thread to avoid
+    client timeouts due to Printful API rate limiting.
+    """
+    start_time = time.time()
+    logger.info("POST /api/batch-mockups - Starting request")
+    
+    try:
+        data = request.get_json()
+        logger.debug(f"Request JSON data: {data}")
+        
+        if not data:
+            return jsonify({
+                "success": False,
+                "error": "No JSON data provided"
+            }), 400
+        
+        # Get configurations
+        configurations = data.get("configurations", [])
+        design_url = data.get("design_url", "")
+        
+        if not configurations:
+            return jsonify({
+                "success": False,
+                "error": "No configurations provided"
+            }), 400
+        
+        if not design_url:
+            return jsonify({
+                "success": False,
+                "error": "design_url is required"
+            }), 400
+        
+        logger.info(f"Creating {len(configurations)} mockup variations")
+        
+        # Create batch ID
+        batch_id = f"batch_{uuid.uuid4().hex[:12]}_{int(time.time())}"
+        
+        # Create batch folder first to ensure it exists
+        batch_folder = os.path.join(MOCKUP_VARIATIONS_FOLDER, batch_id)
+        os.makedirs(batch_folder, exist_ok=True)
+        logger.info(f"Created batch folder: {batch_folder}")
+        
+        # Prepare initial batch metadata with status "pending" - configs not yet processed
+        batch_metadata = {
+            "batch_id": batch_id,
+            "created_at": datetime.now().isoformat(),
+            "design_url": design_url,
+            "configurations": configurations,
+            "variations": [],
+            "status": "pending",  # Changed from "processing" - configs not started yet
+            "task_keys": [],
+            "pending_indices": list(range(len(configurations))),  # Track which configs need processing
+            "completed_indices": [],
+            "failed_indices": []
+        }
+        
+        # Save initial metadata BEFORE starting background processing
+        metadata_path = os.path.join(batch_folder, "metadata.json")
+        with open(metadata_path, "w") as f:
+            json.dump(batch_metadata, f, indent=2)
+        
+        logger.info(f"Batch {batch_id} metadata saved, returning immediately. Configurations will be processed in background.")
+        
+        # Return immediately to client with batch_id
+        # Background thread will process configurations
+        # Read task_keys from metadata (may be empty if background thread hasn't processed yet)
+        with open(metadata_path, "r") as f:
+            current_metadata = json.load(f)
+        
+        response_data = {
+            "success": True,
+            "batch_id": batch_id,
+            "configurations_count": len(configurations),
+            "task_keys": current_metadata.get("task_keys", []),
+            "status": current_metadata.get("status", "pending"),
+            "message": "Batch created. Configurations are being processed in background. Use GET /api/batch-mockups/poll/{batch_id} to check status."
+        }
+        
+        # Start background thread to process configurations
+        import threading
+        
+        def background_process_configs(batch_id, configurations, design_url, batch_folder, metadata_path):
+            """Process configurations in background thread."""
+            logger.info(f"Background thread started for batch {batch_id}")
+            
+            # Load metadata
+            with open(metadata_path, "r") as f:
+                batch_metadata = json.load(f)
+            
+            results = []
+            max_retries = 3
+            
+            for index, config in enumerate(configurations):
+                result = None
+                retry_count = 0
+                retry_delay = 3  # Start with 3 second delay
+                
+                while retry_count < max_retries:
+                    result = process_single_configuration(config, index, design_url)
+                    
+                    logger.info(f"Background: Config {index + 1} result: status={result.get('status')}, task_key={result.get('task_key')}, error={result.get('error')}")
+                    
+                    # Check if we got a rate limit error
+                    if result.get("error") and "429" in str(result.get("error", "")):
+                        retry_count += 1
+                        logger.warning(f"Background: Rate limited on config {index + 1}, retry {retry_count}/{max_retries} after {retry_delay}s")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                    else:
+                        break
+                
+                results.append(result)
+                
+                # Update metadata after each config
+                with open(metadata_path, "r") as f:
+                    batch_metadata = json.load(f)
+                
+                if result.get("task_key"):
+                    batch_metadata["task_keys"].append(result["task_key"])
+                    batch_metadata["completed_indices"].append(index)
+                else:
+                    batch_metadata["failed_indices"].append(index)
+                
+                batch_metadata["pending_indices"] = [i for i in range(len(configurations)) if i not in batch_metadata["completed_indices"] and i not in batch_metadata["failed_indices"]]
+                
+                if batch_metadata["pending_indices"]:
+                    batch_metadata["status"] = "processing"
+                else:
+                    batch_metadata["status"] = "completed"
+                
+                with open(metadata_path, "w") as f:
+                    json.dump(batch_metadata, f, indent=2)
+                
+                # Add delay between requests to avoid rate limiting
+                if index < len(configurations) - 1:
+                    time.sleep(2.0)  # Reduced to 2 seconds for background processing
+            
+            logger.info(f"Background thread completed for batch {batch_id}. Processed {len(results)} configurations.")
+        
+        # Start background thread
+        background_thread = threading.Thread(
+            target=background_process_configs,
+            args=(batch_id, configurations, design_url, batch_folder, metadata_path),
+            daemon=True
+        )
+        background_thread.start()
+        
+        logger.info(f"Background thread started for batch {batch_id}")
+        
+        return jsonify(response_data)
+        
+    except Exception as e:
+        logger.error(f"Error creating batch mockups: {e}")
+        logger.exception("Full stack trace:")
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route("/api/batch-mockups", methods=["GET"])
+def list_batch_mockups():
+    """List all saved batch mockups."""
+    logger.info("GET /api/batch-mockups - Listing all batches")
+    
+    try:
+        batches = []
+        
+        # List all batch folders
+        for batch_folder in os.listdir(MOCKUP_VARIATIONS_FOLDER):
+            batch_path = os.path.join(MOCKUP_VARIATIONS_FOLDER, batch_folder)
+            if os.path.isdir(batch_path):
+                metadata_path = os.path.join(batch_path, "metadata.json")
+                if os.path.exists(metadata_path):
+                    with open(metadata_path, "r") as f:
+                        metadata = json.load(f)
+                        batches.append(metadata)
+                else:
+                    # Folder without metadata
+                    batches.append({
+                        "batch_id": batch_folder,
+                        "created_at": datetime.fromtimestamp(os.path.getctime(batch_path)).isoformat(),
+                        "status": "unknown"
+                    })
+        
+        # Sort by created_at descending
+        batches.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        
+        return jsonify({
+            "success": True,
+            "batches": batches,
+            "total": len(batches)
+        })
+        
+    except Exception as e:
+        logger.error(f"Error listing batches: {e}")
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route("/api/batch-mockups/<batch_id>", methods=["GET"])
+def get_batch_mockup(batch_id):
+    """Get specific batch details and poll for results."""
+    logger.info(f"GET /api/batch-mockups/{batch_id} - Getting batch details")
+    
+    try:
+        batch_folder = os.path.join(MOCKUP_VARIATIONS_FOLDER, batch_id)
+        
+        if not os.path.exists(batch_folder):
+            return jsonify({
+                "success": False,
+                "error": "Batch not found"
+            }), 404
+        
+        # Load metadata
+        metadata_path = os.path.join(batch_folder, "metadata.json")
+        if os.path.exists(metadata_path):
+            with open(metadata_path, "r") as f:
+                metadata = json.load(f)
+        else:
+            metadata = {"batch_id": batch_id, "status": "unknown"}
+        
+        # Check if we need to poll for results
+        task_keys = metadata.get("task_keys", [])
+        
+        if task_keys and metadata.get("status") == "processing":
+            completed_variations = []
+            pending_tasks = []
+            
+            for task_key in task_keys:
+                try:
+                    response = printful_client.get_task_result(task_key)
+                    task_data = response.get("result", {})
+                    status = task_data.get("status", "unknown")
+                    
+                    if status == "completed":
+                        mockups_data = task_data.get("mockups", [])
+                        for m in mockups_data:
+                            if m.get("mockup_url"):
+                                # Download and save the mockup
+                                local_path = save_mockup_image(
+                                    m.get("mockup_url"),
+                                    batch_folder,
+                                    len(completed_variations)
+                                )
+                                if local_path:
+                                    variation = {
+                                        "url": m.get("mockup_url"),
+                                        "local_url": f"/mockup_variations/{batch_id}/{os.path.basename(local_path)}",
+                                        "name": m.get("title", "Front"),
+                                        "placement": metadata.get("configurations", [{}])[len(completed_variations)].get("placement", "front")
+                                    }
+                                    completed_variations.append(variation)
+                    elif status == "pending" or status == "in_progress":
+                        pending_tasks.append(task_key)
+                    else:
+                        # Failed or unknown
+                        pass
+                        
+                except Exception as e:
+                    logger.error(f"Error polling task {task_key}: {e}")
+            
+            # Update metadata
+            metadata["variations"] = completed_variations
+            metadata["pending_tasks"] = pending_tasks
+            
+            if pending_tasks:
+                metadata["status"] = "processing"
+            else:
+                metadata["status"] = "completed" if completed_variations else "failed"
+            
+            # Save updated metadata
+            with open(metadata_path, "w") as f:
+                json.dump(metadata, f, indent=2)
+        
+        return jsonify({
+            "success": True,
+            "batch": metadata
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting batch: {e}")
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route("/api/batch-mockups/<batch_id>", methods=["DELETE"])
+def delete_batch_mockup(batch_id):
+    """Delete a batch and its variations."""
+    logger.info(f"DELETE /api/batch-mockups/{batch_id} - Deleting batch")
+    
+    try:
+        batch_folder = os.path.join(MOCKUP_VARIATIONS_FOLDER, batch_id)
+        
+        if not os.path.exists(batch_folder):
+            return jsonify({
+                "success": False,
+                "error": "Batch not found"
+            }), 404
+        
+        # Delete folder and all contents
+        import shutil
+        shutil.rmtree(batch_folder)
+        
+        logger.info(f"Batch {batch_id} deleted")
+        
+        return jsonify({
+            "success": True,
+            "message": f"Batch {batch_id} deleted successfully"
+        })
+        
+    except Exception as e:
+        logger.error(f"Error deleting batch: {e}")
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route("/api/batch-mockups/poll/<batch_id>", methods=["GET"])
+def poll_batch_results(batch_id):
+    """Poll for batch mockup results."""
+    logger.info(f"GET /api/batch-mockups/poll/{batch_id} - Polling results")
+    
+    try:
+        batch_folder = os.path.join(MOCKUP_VARIATIONS_FOLDER, batch_id)
+        
+        if not os.path.exists(batch_folder):
+            return jsonify({
+                "success": False,
+                "error": "Batch not found"
+            }), 404
+        
+        # Load metadata
+        metadata_path = os.path.join(batch_folder, "metadata.json")
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+        
+        task_keys = metadata.get("task_keys", [])
+        
+        if not task_keys:
+            return jsonify({
+                "success": True,
+                "batch": metadata,
+                "progress": {
+                    "completed": 0,
+                    "pending": 0,
+                    "failed": 0,
+                    "total": 0
+                }
+            })
+        
+        completed_variations = []
+        pending_tasks = []
+        failed_tasks = []
+        
+        for i, task_key in enumerate(task_keys):
+            try:
+                response = printful_client.get_task_result(task_key)
+                task_data = response.get("result", {})
+                status = task_data.get("status", "unknown")
+                
+                if status == "completed":
+                    mockups_data = task_data.get("mockups", [])
+                    for m in mockups_data:
+                        if m.get("mockup_url"):
+                            # Check if already saved locally
+                            existing_files = [f for f in os.listdir(batch_folder) if f.startswith(f"mockup_{i}_")]
+                            
+                            if not existing_files:
+                                local_path = save_mockup_image(
+                                    m.get("mockup_url"),
+                                    batch_folder,
+                                    i
+                                )
+                            else:
+                                local_path = os.path.join(batch_folder, existing_files[0])
+                            
+                            config = metadata.get("configurations", [{}])[i] if i < len(metadata.get("configurations", [])) else {}
+                            
+                            variation = {
+                                "url": m.get("mockup_url"),
+                                "local_url": f"/mockup_variations/{batch_id}/{os.path.basename(local_path)}" if local_path else None,
+                                "name": m.get("title", "Front"),
+                                "placement": config.get("placement", "front"),
+                                "position": {"x": config.get("x"), "y": config.get("y")},
+                                "scale": config.get("scale"),
+                                "rotation": config.get("rotation"),
+                                "config_index": i
+                            }
+                            completed_variations.append(variation)
+                            
+                elif status == "pending" or status == "in_progress":
+                    pending_tasks.append(task_key)
+                else:
+                    failed_tasks.append(task_key)
+                    
+            except Exception as e:
+                logger.error(f"Error polling task {task_key}: {e}")
+                failed_tasks.append(task_key)
+        
+        # Update metadata
+        metadata["variations"] = completed_variations
+        metadata["pending_tasks"] = pending_tasks
+        metadata["failed_tasks"] = failed_tasks
+        
+        if pending_tasks:
+            metadata["status"] = "processing"
+            metadata["progress"] = f"{len(completed_variations)}/{len(task_keys)} completed"
+        else:
+            metadata["status"] = "completed" if completed_variations else "failed"
+        
+        # Save updated metadata
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+        
+        return jsonify({
+            "success": True,
+            "batch": metadata,
+            "progress": {
+                "completed": len(completed_variations),
+                "pending": len(pending_tasks),
+                "failed": len(failed_tasks),
+                "total": len(task_keys)
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Error polling batch results: {e}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "progress": {
+                "completed": 0,
+                "pending": 0,
+                "failed": 0,
+                "total": 0
+            }
+        }), 500
+
+
+# ============================================================
+# TEST ENDPOINT - Generate test batch with test.png
+# ============================================================
+
+@app.route("/api/batch-mockups/test", methods=["POST"])
+def test_batch_mockups():
+    """Test endpoint to generate batch mockups using test.png."""
+    start_time = time.time()
+    logger.info("POST /api/batch-mockups/test - Starting test batch")
+    
+    try:
+        # Get test.png path
+        test_png_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test.png")
+        
+        if not os.path.exists(test_png_path):
+            return jsonify({
+                "success": False,
+                "error": "test.png not found in project root"
+            }), 404
+        
+        logger.info(f"Found test.png at: {test_png_path}")
+        
+        # Upload to R2
+        filename = "test.png"
+        r2_result = r2_client.upload_file(test_png_path, filename)
+        design_url = r2_result["public_url"]
+        
+        logger.info(f"Uploaded test.png to R2: {design_url}")
+        
+        # Create 4 test configurations as specified
+        configurations = [
+            {"name": "Center, 100%, 0°", "x": 50, "y": 50, "scale": 100, "rotation": 0, "placement": "front"},
+            {"name": "Top-Left, 80%, 0°", "x": 30, "y": 30, "scale": 80, "rotation": 0, "placement": "front"},
+            {"name": "Bottom-Right, 120%, 45°", "x": 70, "y": 70, "scale": 120, "rotation": 45, "placement": "front"},
+            {"name": "Center, 150%, 90°", "x": 50, "y": 50, "scale": 150, "rotation": 90, "placement": "front"}
+        ]
+        
+        # Create batch ID
+        batch_id = f"test_batch_{uuid.uuid4().hex[:8]}_{int(time.time())}"
+        batch_folder = create_batch_folder(batch_id)
+        
+        # Prepare batch metadata
+        batch_metadata = {
+            "batch_id": batch_id,
+            "created_at": datetime.now().isoformat(),
+            "design_url": design_url,
+            "configurations": configurations,
+            "variations": [],
+            "status": "processing"
+        }
+        
+        # Process configurations sequentially for better error handling
+        results = []
+        for index, config in enumerate(configurations):
+            try:
+                design_params = [{
+                    "name": config["name"],
+                    "x": config["x"],
+                    "y": config["y"],
+                    "scale": config["scale"],
+                    "rotation": config["rotation"]
+                }]
+                
+                logger.info(f"Creating mockup for config {index + 1}: {config}")
+                logger.info(f"design_params: {design_params}")
+                
+                response = printful_client.create_mockup_task(
+                    product_id=PRODUCT_ID,
+                    variant_ids=[VARIANT_ID],
+                    image_url=design_url,
+                    design_params=design_params
+                )
+                
+                logger.info(f"Printful response: {response}")
+                
+                task_key = response.get("task_key") or response.get("result", {}).get("task_key")
+                logger.info(f"Task key: {task_key}")
+                
+                results.append({
+                    "index": index,
+                    "config": config,
+                    "task_key": task_key,
+                    "status": "created",
+                    "error": None
+                })
+            except Exception as e:
+                import traceback
+                logger.error(f"Error creating mockup for config {index}: {e}")
+                logger.error(traceback.format_exc())
+                results.append({
+                    "index": index,
+                    "config": config,
+                    "task_key": None,
+                    "status": "error",
+                    "error": str(e)
+                })
+        
+        # Store task keys
+        batch_metadata["task_keys"] = [r["task_key"] for r in results if r["task_key"]]
+        
+        # Save metadata
+        metadata_path = os.path.join(batch_folder, "metadata.json")
+        with open(metadata_path, "w") as f:
+            json.dump(batch_metadata, f, indent=2)
+        
+        duration = (time.time() - start_time) * 1000
+        logger.info(f"Test batch {batch_id} created in {duration:.2f}ms with {len(results)} configurations")
+        
+        return jsonify({
+            "success": True,
+            "batch_id": batch_id,
+            "configurations_count": len(configurations),
+            "task_keys": batch_metadata["task_keys"],
+            "message": "Test batch created. Use GET /api/batch-mockups/poll/{batch_id} to check status."
+        })
+        
+    except Exception as e:
+        logger.error(f"Error creating test batch: {e}")
+        logger.exception("Full stack trace:")
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 if __name__ == "__main__":
     logger.info("=" * 60)

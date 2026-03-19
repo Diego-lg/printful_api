@@ -1,0 +1,85 @@
+{
+  "design_url": "http://127.0.0.1:5000/uploads/5c1adcb5d0b34a96a6a88a678aaefe77_1773182245.png",
+  "configurations": [
+    {
+      "name": "Center, 100%, 0°",
+      "x": 50,
+      "y": 50,
+      "scale": 100,
+      "rotation": 0,
+      "placement": "front"
+    },
+    {
+      "name": "Top-Left, 80%, 0°",
+      "x": 30,
+      "y": 30,
+      "scale": 80,
+      "rotation": 0,
+      "placement": "front"
+    },
+    {
+      "name": "Bottom-Right, 80%, 0°",
+      "x": 70,
+      "y": 70,
+      "scale": 80,
+      "rotation": 0,
+      "placement": "front"
+    },
+    {
+      "name": "Top-Right, 70%, 0°",
+      "x": 70,
+      "y": 30,
+      "scale": 70,
+      "rotation": 0,
+      "placement": "front"
+    },
+    {
+      "name": "Bottom-Left, 70%, 0°",
+      "x": 30,
+      "y": 70,
+      "scale": 70,
+      "rotation": 0,
+      "placement": "front"
+    },
+    {
+      "name": "Center, 50%, 0°",
+      "x": 50,
+      "y": 50,
+      "scale": 50,
+      "rotation": 0,
+      "placement": "front"
+    },
+    {
+      "name": "Center, 80%, 15°",
+      "x": 50,
+      "y": 50,
+      "scale": 80,
+      "rotation": 15,
+      "placement": "front"
+    },
+    {
+      "name": "Center, 80%, -15°",
+      "x": 50,
+      "y": 50,
+      "scale": 80,
+      "rotation": -15,
+      "placement": "front"
+    },
+    {
+      "name": "Center, 60%, 30°",
+      "x": 50,
+      "y": 50,
+      "scale": 60,
+      "rotation": 30,
+      "placement": "front"
+    },
+    {
+      "name": "Center, 60%, -30°",
+      "x": 50,
+      "y": 50,
+      "scale": 60,
+      "rotation": -30,
+      "placement": "front"
+    }
+  ]
+}
